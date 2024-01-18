@@ -28,6 +28,7 @@ TOKEN_COSTS = {
     "gpt-4-1106-preview": {"prompt": 0.01, "completion": 0.03},
     "text-embedding-ada-002": {"prompt": 0.0004, "completion": 0.0},
     "chatglm_turbo": {"prompt": 0.0, "completion": 0.00069},  # 32k version, prompt + completion tokens=0.005￥/k-tokens
+    "glm-4": {"prompt": 0.0, "completion": 0.014},  # 128k version, prompt + completion tokens=0.1￥/k-tokens
     "gemini-pro": {"prompt": 0.00025, "completion": 0.0005},
 }
 
@@ -49,6 +50,7 @@ TOKEN_MAX = {
     "gpt-4-1106-preview": 128000,
     "text-embedding-ada-002": 8192,
     "chatglm_turbo": 32768,
+    "glm-4": 128000,
     "gemini-pro": 32768,
 }
 

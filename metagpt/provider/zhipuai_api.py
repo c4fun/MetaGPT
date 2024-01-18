@@ -6,7 +6,7 @@ import json
 from enum import Enum
 
 import openai
-import zhipuai
+from zhipuai import ZhipuAI
 from requests import ConnectionError
 from tenacity import (
     after_log,
@@ -21,8 +21,12 @@ from metagpt.logs import log_llm_stream, logger
 from metagpt.provider.base_llm import BaseLLM
 from metagpt.provider.llm_provider_registry import register_provider
 from metagpt.provider.openai_api import log_and_reraise
-from metagpt.provider.zhipuai.zhipu_model_api import ZhiPuModelAPI
+# from metagpt.provider.zhipuai.zhipu_model_api import ZhiPuModelAPI
 
+from zhipuai.types.chat.chat_completion import Completion, CompletionChoice, CompletionMessage
+from zhipuai.types.chat.chat_completion import CompletionUsage
+from zhipuai.types.chat.chat_completion_chunk import ChoiceDelta
+from zhipuai.types.chat.chat_completion_chunk import CompletionUsage as ChunkCompletionUsage
 
 class ZhiPuEvent(Enum):
     ADD = "add"
@@ -39,49 +43,58 @@ class ZhiPuAILLM(BaseLLM):
     """
 
     def __init__(self):
-        self.__init_zhipuai(CONFIG)
-        self.llm = ZhiPuModelAPI
-        self.model = "chatglm_turbo"  # so far only one model, just use it
+        self.llmclient = ZhipuAI(api_key=CONFIG.zhipuai_api_key)
+        self.model = "glm-4"  # so far only one model, just use it
         self.use_system_prompt: bool = False  # zhipuai has no system prompt when use api
 
-    def __init_zhipuai(self, config: CONFIG):
-        assert config.zhipuai_api_key
-        zhipuai.api_key = config.zhipuai_api_key
-        # due to use openai sdk, set the api_key but it will't be used.
-        # openai.api_key = zhipuai.api_key  # due to use openai sdk, set the api_key but it will't be used.
-        if config.openai_proxy:
-            # FIXME: openai v1.x sdk has no proxy support
-            openai.proxy = config.openai_proxy
 
     def _const_kwargs(self, messages: list[dict]) -> dict:
-        kwargs = {"model": self.model, "prompt": messages, "temperature": 0.3}
+        kwargs = {"model": self.model, "messages": messages, "temperature": 0.3}
         return kwargs
 
-    def _update_costs(self, usage: dict):
+    def _update_costs(self, usage):
         """update each request's token cost"""
         if CONFIG.calc_usage:
             try:
-                prompt_tokens = int(usage.get("prompt_tokens", 0))
-                completion_tokens = int(usage.get("completion_tokens", 0))
+                prompt_tokens = usage.prompt_tokens
+                completion_tokens = usage.completion_tokens
                 CONFIG.cost_manager.update_cost(prompt_tokens, completion_tokens, self.model)
             except Exception as e:
-                logger.error(f"zhipuai updats costs failed! exp: {e}")
+                logger.error(f"zhipuai updates costs failed! exp: {e}")
 
     def get_choice_text(self, resp: dict) -> str:
         """get the first text of choice from llm response"""
-        assist_msg = resp.get("data", {}).get("choices", [{"role": "error"}])[-1]
-        assert assist_msg["role"] == "assistant"
-        return assist_msg.get("content")
+        # assist_msg = resp.get("choices", [{"role": "error"}])[-1]
+        # assert assist_msg["role"] == "assistant"
+        # return assist_msg.get("content")
+
+        usage = resp.usage
+        assert isinstance(usage, CompletionUsage)
+        self._update_costs(usage)
+
+        assert isinstance(resp, Completion) # assert the type is a completion
+        assist_choice = resp.choices[-1]
+        assert isinstance(assist_choice, CompletionChoice)
+        assist_msg = assist_choice.message
+        assert isinstance(assist_msg, CompletionMessage)
+        return assist_msg.content
+
+        # assist_msg = resp
+        # print(resp)
+        # return assist_msg.get("content")
 
     def completion(self, messages: list[dict], timeout=3) -> dict:
-        resp = self.llm.invoke(**self._const_kwargs(messages))
-        usage = resp.get("data").get("usage")
-        self._update_costs(usage)
+        # resp = self.llm(**self._const_kwargs(messages))
+        resp = self.llmclient.chat.completions.create(**self._const_kwargs(messages))
+        print(f'Type of resp in completion: {type(resp)}')
+        # usage = resp.get("data").get("usage")
+        # self._update_costs(usage)
         return resp
 
     async def _achat_completion(self, messages: list[dict], timeout=3) -> dict:
-        resp = await self.llm.ainvoke(**self._const_kwargs(messages))
-        usage = resp.get("data").get("usage")
+        resp = self.llmclient.chat.completions.create(**self._const_kwargs(messages))
+        # print(f'Type of resp in _achat_completion: {type(resp)}')
+        usage = resp.usage
         self._update_costs(usage)
         return resp
 
@@ -89,40 +102,29 @@ class ZhiPuAILLM(BaseLLM):
         return await self._achat_completion(messages, timeout=timeout)
 
     async def _achat_completion_stream(self, messages: list[dict], timeout=3) -> str:
-        response = await self.llm.asse_invoke(**self._const_kwargs(messages))
+        # response = self.llmclient.chat.asyncCompletions.create(**self._const_kwargs(messages))
+        response = self.llmclient.chat.completions.create(**self._const_kwargs(messages),stream=True)
         collected_content = []
         usage = {}
-        async for event in response.async_events():
-            if event.event == ZhiPuEvent.ADD.value:
-                content = event.data
-                collected_content.append(content)
-                log_llm_stream(content)
-            elif event.event == ZhiPuEvent.ERROR.value or event.event == ZhiPuEvent.INTERRUPTED.value:
-                content = event.data
-                logger.error(f"event error: {content}", end="")
-            elif event.event == ZhiPuEvent.FINISH.value:
-                """
-                event.meta
-                    {
-                        "task_status":"SUCCESS",
-                        "usage":{
-                            "completion_tokens":351,
-                            "prompt_tokens":595,
-                            "total_tokens":946
-                        },
-                        "task_id":"xx",
-                        "request_id":"xxx"
-                    }
-                """
-                meta = json.loads(event.meta)
-                usage = meta.get("usage")
-            else:
-                print(f"zhipuapi else event: {event.data}", end="")
+        for chunk in response:
+
+            # TODO：解决usage的问题
+            # # 不知道为啥usage是none,改到下面也没有好转。可能跟定义中的可选有关
+            # print(f'Type of chunk: {type(chunk)}')  # Type of chunk: <class 'zhipuai.types.chat.chat_completion_chunk.ChatCompletionChunk'>
+            # usage = chunk.usage
+            # print(f'Type of usage: {type(usage)}')  # Type of usage: <class 'NoneType'>
+            # # self._update_costs(usage)
+
+            choice_delta = chunk.choices[0].delta
+            assert isinstance(choice_delta, ChoiceDelta)
+            content = choice_delta.content
+            collected_content.append(content)
+            log_llm_stream(content)
         log_llm_stream("\n")
 
-        self._update_costs(usage)
         full_content = "".join(collected_content)
         return full_content
+
 
     @retry(
         stop=stop_after_attempt(3),
